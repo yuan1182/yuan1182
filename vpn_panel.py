@@ -116,8 +116,8 @@ class VPNPanelApp:
         self.entry_email = ttk.Entry(email_frame, width=25)
         self.entry_email.pack(side=tk.LEFT, padx=5)
 
-        btn_init = ttk.Button(frame, text="一键初始化环境并配置证书", command=self.init_env_async)
-        btn_init.pack(pady=10)
+        self.btn_init = ttk.Button(frame, text="一键初始化环境并配置证书", command=self.init_env_async)
+        self.btn_init.pack(pady=10)
 
         self.text_log = tk.Text(frame, height=8, state='disabled')
         self.text_log.pack(fill="both", expand=True, padx=10, pady=10)
@@ -127,6 +127,10 @@ class VPNPanelApp:
 
     def check_status(self):
         self.log("正在检查服务状态...")
+        self.lbl_status.config(text="VPN服务状态: 获取中...", foreground="orange")
+        threading.Thread(target=self._check_status_thread, daemon=True).start()
+
+    def _check_status_thread(self):
         script = """
         $service = Get-Service RemoteAccess -ErrorAction SilentlyContinue
         if ($service) {
@@ -137,6 +141,9 @@ class VPNPanelApp:
         """
         code, out, err = run_powershell(script)
         status_text = out.strip()
+        self.root.after(0, self._update_status_ui, status_text)
+
+    def _update_status_ui(self, status_text):
         if "Running" in status_text:
             self.lbl_status.config(text="VPN服务状态: 运行中", foreground="green")
             self.log("RemoteAccess 服务运行中。")
@@ -151,23 +158,29 @@ class VPNPanelApp:
 
     def start_service(self):
         self.log("正在启动 VPN 服务...")
+        threading.Thread(target=self._start_service_thread, daemon=True).start()
+
+    def _start_service_thread(self):
         code, out, err = run_powershell("Start-Service RemoteAccess -ErrorAction Stop")
         if code == 0:
-            self.log("服务已启动。")
+            self.root.after(0, self.log, "服务已启动。")
         else:
-            self.log(f"启动失败: {err}")
-        self.check_status()
+            self.root.after(0, self.log, f"启动失败: {err}")
+        self.root.after(0, self.check_status)
 
     def stop_service(self):
         if not messagebox.askyesno("确认", "确定要停止 VPN 服务吗？\n这将断开所有当前连接。"):
             return
         self.log("正在停止 VPN 服务...")
+        threading.Thread(target=self._stop_service_thread, daemon=True).start()
+
+    def _stop_service_thread(self):
         code, out, err = run_powershell("Stop-Service RemoteAccess -Force -ErrorAction Stop")
         if code == 0:
-            self.log("服务已停止。")
+            self.root.after(0, self.log, "服务已停止。")
         else:
-            self.log(f"停止失败: {err}")
-        self.check_status()
+            self.root.after(0, self.log, f"停止失败: {err}")
+        self.root.after(0, self.check_status)
 
     def init_env_async(self):
         domain = self.entry_domain.get().strip()
@@ -180,22 +193,26 @@ class VPNPanelApp:
         if not messagebox.askyesno("确认", "初始化操作将安装RRAS角色，申请Let's Encrypt证书并配置VPN及NAT。\n这可能需要几分钟时间，且期间网络可能会短暂中断。\n是否继续？"):
             return
 
+        self.btn_init.config(state=tk.DISABLED, text="初始化中...")
         threading.Thread(target=self.init_env, args=(domain, email), daemon=True).start()
 
+    def thread_safe_log(self, message):
+        self.root.after(0, self.log, message)
+
     def init_env(self, domain, email):
-        self.log("开始初始化环境...")
+        self.thread_safe_log("开始初始化环境...")
 
         # 1. Install RRAS Role
-        self.log("正在安装 Routing and Remote Access 角色...")
+        self.thread_safe_log("正在安装 Routing and Remote Access 角色...")
         install_script = "Install-WindowsFeature -Name DirectAccess-VPN, Routing -IncludeManagementTools"
         code, out, err = run_powershell(install_script)
         if code != 0:
-            self.log(f"角色安装失败: {err}")
+            self.thread_safe_log(f"角色安装失败: {err}")
             return
-        self.log("角色安装成功。")
+        self.thread_safe_log("角色安装成功。")
 
         # 2. Configure VPN and NAT
-        self.log("正在配置 VPN 和 NAT 服务...")
+        self.thread_safe_log("正在配置 VPN 和 NAT 服务...")
         config_script = """
         Install-RemoteAccess -VpnType Vpn -ErrorAction SilentlyContinue
 
@@ -214,22 +231,29 @@ class VPNPanelApp:
         """
         code, out, err = run_powershell(config_script)
 
+        # Escape domain and email to prevent trivial command injection issues
+        ps_domain = domain.replace("'", "''")
+        ps_email = email.replace("'", "''")
+
         # 3. Setup Posh-ACME and request cert
-        self.log("正在安装 Posh-ACME 并申请 Let's Encrypt 证书...")
+        self.thread_safe_log("正在安装 Posh-ACME 并申请 Let's Encrypt 证书...")
         cert_script = f"""
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue
-        Install-Module -Name Posh-ACME -Force -AcceptLicense -ErrorAction SilentlyContinue
+
+        # Trust PSGallery to avoid prompt and remove -AcceptLicense which fails on PS 5.1
+        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+        Install-Module -Name Posh-ACME -Force -ErrorAction SilentlyContinue
         Import-Module Posh-ACME
 
         Set-PAServer LE_PROD
 
         # Use the Standalone plugin to handle the HTTP-01 challenge by spinning up a temporary web server
         # This requires Port 80 to be open and not used by IIS or another service
-        New-PACertificate {domain} -AcceptTOS -Contact {email} -Install -Plugin Standalone
+        New-PACertificate '{ps_domain}' -AcceptTOS -Contact '{ps_email}' -Install -Plugin Standalone
 
         # Bind the certificate to SSTP and IKEv2
-        $cert = Get-ChildItem -Path Cert:\\LocalMachine\\My | Where-Object Subject -match "{domain}" | Select-Object -First 1
+        $cert = Get-ChildItem -Path Cert:\\LocalMachine\\My | Where-Object Subject -match '{ps_domain}' | Select-Object -First 1
         if ($cert) {{
             $hash = $cert.Thumbprint
             Write-Output "Certificate generated: $hash"
@@ -255,16 +279,20 @@ class VPNPanelApp:
         """
         code, out, err = run_powershell(cert_script)
         if "Certificate generated" in out:
-            self.log(f"证书申请并配置成功！")
+            self.thread_safe_log(f"证书申请并配置成功！")
         else:
-            self.log(f"证书配置出现问题，请检查日志。")
+            self.thread_safe_log(f"证书配置出现问题，请检查日志。")
             if err:
-                self.log(err)
+                self.thread_safe_log(err)
 
-        self.log("环境初始化完成。")
+        self.thread_safe_log("环境初始化完成。")
 
-        # Refresh status in main thread
-        self.root.after(0, self.check_status)
+        # Refresh status in main thread and re-enable button
+        self.root.after(0, self._init_env_callback)
+
+    def _init_env_callback(self):
+        self.btn_init.config(state=tk.NORMAL, text="一键初始化环境并配置证书")
+        self.check_status()
 
     def init_users_tab(self):
         # 左右分栏
@@ -285,14 +313,14 @@ class VPNPanelApp:
         self.entry_password = ttk.Entry(left_frame, show="*")
         self.entry_password.pack(fill='x', pady=5)
 
-        btn_add_user = ttk.Button(left_frame, text="添加用户并允许拨入", command=self.add_user)
-        btn_add_user.pack(fill='x', pady=10)
+        self.btn_add_user = ttk.Button(left_frame, text="添加用户并允许拨入", command=self.add_user)
+        self.btn_add_user.pack(fill='x', pady=10)
 
-        btn_del_user = ttk.Button(left_frame, text="删除选中用户", command=self.delete_user)
-        btn_del_user.pack(fill='x', pady=5)
+        self.btn_del_user = ttk.Button(left_frame, text="删除选中用户", command=self.delete_user)
+        self.btn_del_user.pack(fill='x', pady=5)
 
-        btn_refresh = ttk.Button(left_frame, text="刷新用户列表", command=self.refresh_users)
-        btn_refresh.pack(fill='x', pady=20)
+        self.btn_refresh = ttk.Button(left_frame, text="刷新用户列表", command=self.refresh_users)
+        self.btn_refresh.pack(fill='x', pady=20)
 
         # 右侧表格
         columns = ("username", "dial_in", "status")
@@ -313,7 +341,10 @@ class VPNPanelApp:
         # Clear existing items
         for item in self.tree_users.get_children():
             self.tree_users.delete(item)
+        self.tree_users.insert('', tk.END, values=("加载中...", "", ""))
+        threading.Thread(target=self._refresh_users_thread, daemon=True).start()
 
+    def _refresh_users_thread(self):
         script = """
         $users = Get-LocalUser | Select-Object Name, Enabled
         $results = @()
@@ -350,16 +381,23 @@ class VPNPanelApp:
         $results | ConvertTo-Json
         """
         code, out, err = run_powershell(script)
+        users_data = []
         if code == 0 and out.strip():
             import json
             try:
-                users = json.loads(out)
-                if not isinstance(users, list):
-                    users = [users]
-                for u in users:
-                    self.tree_users.insert('', tk.END, values=(u.get('Username'), u.get('DialIn'), u.get('Status')))
+                parsed = json.loads(out)
+                if not isinstance(parsed, list):
+                    parsed = [parsed]
+                users_data = parsed
             except json.JSONDecodeError:
                 pass
+        self.root.after(0, self._update_users_ui, users_data)
+
+    def _update_users_ui(self, users_data):
+        for item in self.tree_users.get_children():
+            self.tree_users.delete(item)
+        for u in users_data:
+            self.tree_users.insert('', tk.END, values=(u.get('Username'), u.get('DialIn'), u.get('Status')))
 
     def add_user(self):
         username = self.entry_username.get().strip()
@@ -372,7 +410,6 @@ class VPNPanelApp:
         ps_username = username.replace("'", "''")
         ps_password = password.replace("'", "''")
 
-        # Create or update user and set dial-in
         script = f"""
         $Password = ConvertTo-SecureString '{ps_password}' -AsPlainText -Force
         $user = Get-LocalUser -Name '{ps_username}' -ErrorAction SilentlyContinue
@@ -389,7 +426,15 @@ class VPNPanelApp:
         $userObj.Put("msNPAllowDialin", $true)
         $userObj.SetInfo()
         """
+        self.btn_add_user.config(state=tk.DISABLED, text="处理中...")
+        threading.Thread(target=self._add_user_thread, args=(script, username), daemon=True).start()
+
+    def _add_user_thread(self, script, username):
         code, out, err = run_powershell(script)
+        self.root.after(0, self._add_user_callback, code, out, err, username)
+
+    def _add_user_callback(self, code, out, err, username):
+        self.btn_add_user.config(state=tk.NORMAL, text="添加用户并允许拨入")
         if code == 0:
             if "updated" in out:
                 messagebox.showinfo("成功", f"用户 {username} 密码已修改，并确保允许拨入。")
@@ -409,12 +454,21 @@ class VPNPanelApp:
         username = item['values'][0]
 
         if messagebox.askyesno("确认", f"确定要删除用户 {username} 吗？"):
-            script = f'Remove-LocalUser -Name "{username}"'
-            code, out, err = run_powershell(script)
-            if code == 0:
-                self.refresh_users()
-            else:
-                messagebox.showerror("错误", f"删除用户失败: {err}")
+            ps_username = username.replace("'", "''")
+            script = f"Remove-LocalUser -Name '{ps_username}'"
+            self.btn_del_user.config(state=tk.DISABLED, text="处理中...")
+            threading.Thread(target=self._delete_user_thread, args=(script,), daemon=True).start()
+
+    def _delete_user_thread(self, script):
+        code, out, err = run_powershell(script)
+        self.root.after(0, self._delete_user_callback, code, err)
+
+    def _delete_user_callback(self, code, err):
+        self.btn_del_user.config(state=tk.NORMAL, text="删除选中用户")
+        if code == 0:
+            self.refresh_users()
+        else:
+            messagebox.showerror("错误", f"删除用户失败: {err}")
 
     def init_network_tab(self):
         frame = ttk.LabelFrame(self.tab_network, text="VPN IP池与网络设置")
@@ -434,8 +488,8 @@ class VPNPanelApp:
         self.entry_ip_end.insert(0, "10.10.10.250")
         self.entry_ip_end.grid(row=1, column=1, padx=5, pady=5)
 
-        btn_apply_pool = ttk.Button(frame, text="应用 IP 池设置", command=self.apply_ip_pool)
-        btn_apply_pool.pack(pady=10)
+        self.btn_apply_pool = ttk.Button(frame, text="应用 IP 池设置", command=self.apply_ip_pool)
+        self.btn_apply_pool.pack(pady=10)
 
         ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=15)
 
@@ -453,8 +507,8 @@ class VPNPanelApp:
         self.entry_dns2.insert(0, "1.1.1.1")
         self.entry_dns2.grid(row=0, column=3, padx=5)
 
-        btn_apply_dns = ttk.Button(frame, text="应用 DNS 设置", command=self.apply_dns)
-        btn_apply_dns.pack(pady=10)
+        self.btn_apply_dns = ttk.Button(frame, text="应用 DNS 设置", command=self.apply_dns)
+        self.btn_apply_dns.pack(pady=10)
 
     def apply_ip_pool(self):
         start_ip = self.entry_ip_start.get().strip()
@@ -463,7 +517,6 @@ class VPNPanelApp:
             messagebox.showwarning("警告", "请输入有效的IP地址范围！")
             return
 
-        # Configure static IP pool for remote clients
         script = f"""
         # Clear existing ranges first
         netsh ras ip show range | ForEach-Object {{
@@ -476,7 +529,6 @@ class VPNPanelApp:
         netsh ras ip set addrassign method=pool
 
         # Also need to update the NAT rule to cover the new pool
-        # Assuming typical /24 subnet for the pool just as a broad stroke
         $ipParts = "{start_ip}".Split('.')
         if ($ipParts.Count -eq 4) {{
             $network = "$($ipParts[0]).$($ipParts[1]).$($ipParts[2]).0/24"
@@ -484,11 +536,20 @@ class VPNPanelApp:
             New-NetNat -Name "VPN-NAT" -InternalIPInterfaceAddressPrefix $network -ErrorAction SilentlyContinue
         }}
         """
+        self.btn_apply_pool.config(state=tk.DISABLED, text="处理中...")
+        threading.Thread(target=self._apply_ip_pool_thread, args=(script,), daemon=True).start()
+
+    def _apply_ip_pool_thread(self, script):
         code, out, err = run_powershell(script)
+        self.root.after(0, self._apply_ip_pool_callback, code, err)
+
+    def _apply_ip_pool_callback(self, code, err):
+        self.btn_apply_pool.config(state=tk.NORMAL, text="应用 IP 池设置")
         if code == 0:
             messagebox.showinfo("成功", "IP 地址池已更新。")
         else:
             messagebox.showerror("错误", f"更新 IP 地址池失败: {err}")
+
 
     def apply_dns(self):
         dns1 = self.entry_dns1.get().strip()
@@ -498,17 +559,21 @@ class VPNPanelApp:
             messagebox.showwarning("警告", "请至少输入一个DNS地址！")
             return
 
-        # Configure DNS for remote access clients
-        # For standard RRAS static pools without DHCP, we can set it via netsh and registry.
         reg_cmds = []
         if dns1:
-            # Set-DnsClientServerAddress requires an interface alias, but we can set the ras interface DNS settings
             reg_cmds.append(f'Set-ItemProperty -Path "HKLM:\\System\\CurrentControlSet\\Services\\RemoteAccess\\Parameters\\IP" -Name "DNS" -Value "{dns1}"')
             reg_cmds.append(f'netsh ras ip set dnsserver "{dns1}"')
 
         script = "\n".join(reg_cmds)
-        code, out, err = run_powershell(script)
+        self.btn_apply_dns.config(state=tk.DISABLED, text="处理中...")
+        threading.Thread(target=self._apply_dns_thread, args=(script,), daemon=True).start()
 
+    def _apply_dns_thread(self, script):
+        code, out, err = run_powershell(script)
+        self.root.after(0, self._apply_dns_callback)
+
+    def _apply_dns_callback(self):
+        self.btn_apply_dns.config(state=tk.NORMAL, text="应用 DNS 设置")
         messagebox.showinfo("成功", "DNS设置已更新。\n(注: 某些环境下VPN客户端可能继承服务器主网卡的DNS)")
 
 if __name__ == "__main__":
