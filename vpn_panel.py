@@ -248,9 +248,9 @@ class VPNPanelApp:
 
         Set-PAServer LE_PROD
 
-        # Use the Standalone plugin to handle the HTTP-01 challenge by spinning up a temporary web server
+        # Use the WebSelfHost plugin to handle the HTTP-01 challenge by spinning up a temporary web server
         # This requires Port 80 to be open and not used by IIS or another service
-        New-PACertificate '{ps_domain}' -AcceptTOS -Contact '{ps_email}' -Install -Plugin Standalone
+        New-PACertificate '{ps_domain}' -AcceptTOS -Contact '{ps_email}' -Install -Plugin WebSelfHost
 
         # Bind the certificate to SSTP and IKEv2
         $cert = Get-ChildItem -Path Cert:\\LocalMachine\\My | Where-Object Subject -match '{ps_domain}' | Select-Object -First 1
